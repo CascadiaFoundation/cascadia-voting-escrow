@@ -1,7 +1,7 @@
 # @version 0.2.7
 """
-@title Curve Fee Distribution
-@author Curve Finance
+@title Cascadia Fee Distribution
+@author Cascadia & Curve Finance
 @license MIT
 """
 
@@ -55,7 +55,6 @@ last_token_time: public(uint256)
 tokens_per_week: public(uint256[1000000000000000])
 
 voting_escrow: public(address)
-token: public(address)
 total_received: public(uint256)
 token_last_balance: public(uint256)
 
@@ -72,7 +71,6 @@ is_killed: public(bool)
 def __init__(
     _voting_escrow: address,
     _start_time: uint256,
-    _token: address,
     _admin: address,
     _emergency_return: address
 ):
@@ -80,7 +78,6 @@ def __init__(
     @notice Contract constructor
     @param _voting_escrow VotingEscrow contract address
     @param _start_time Epoch time for fee distribution to start
-    @param _token Fee token address (3CRV)
     @param _admin Admin address
     @param _emergency_return Address to transfer `_token` balance to
                              if this contract is killed
@@ -89,7 +86,6 @@ def __init__(
     self.start_time = t
     self.last_token_time = t
     self.time_cursor = t
-    self.token = _token
     self.voting_escrow = _voting_escrow
     self.admin = _admin
     self.emergency_return = _emergency_return
@@ -97,7 +93,7 @@ def __init__(
 
 @internal
 def _checkpoint_token():
-    token_balance: uint256 = ERC20(self.token).balanceOf(self)
+    token_balance: uint256 = self.balance
     to_distribute: uint256 = token_balance - self.token_last_balance
     self.token_last_balance = token_balance
 
@@ -177,10 +173,10 @@ def _find_timestamp_user_epoch(ve: address, user: address, _timestamp: uint256, 
 @external
 def ve_for_at(_user: address, _timestamp: uint256) -> uint256:
     """
-    @notice Get the veCRV balance for `_user` at `_timestamp`
+    @notice Get the veCC balance for `_user` at `_timestamp`
     @param _user Address to query balance for
     @param _timestamp Epoch time
-    @return uint256 veCRV balance
+    @return uint256 veCC balance
     """
     ve: address = self.voting_escrow
     max_user_epoch: uint256 = VotingEscrow(ve).user_point_epoch(_user)
@@ -216,7 +212,7 @@ def _checkpoint_total_supply():
 @external
 def checkpoint_total_supply():
     """
-    @notice Update the veCRV total supply checkpoint
+    @notice Update the veCC total supply checkpoint
     @dev The checkpoint is also updated by the first claimant each
          new epoch week. This function may be called independently
          of a claim, to reduce claiming gas costs.
@@ -298,8 +294,8 @@ def _claim(addr: address, ve: address, _last_token_time: uint256) -> uint256:
 def claim(_addr: address = msg.sender) -> uint256:
     """
     @notice Claim fees for `_addr`
-    @dev Each call to claim look at a maximum of 50 user veCRV points.
-         For accounts with many veCRV related actions, this function
+    @dev Each call to claim look at a maximum of 50 user veCC points.
+         For accounts with many veCC related actions, this function
          may need to be called more than once to claim all available
          fees. In the `Claimed` event that fires, if `claim_epoch` is
          less than `max_epoch`, the account may claim again.
@@ -321,8 +317,7 @@ def claim(_addr: address = msg.sender) -> uint256:
 
     amount: uint256 = self._claim(_addr, self.voting_escrow, last_token_time)
     if amount != 0:
-        token: address = self.token
-        assert ERC20(token).transfer(_addr, amount)
+        send(_addr, amount)
         self.token_last_balance -= amount
 
     return amount
@@ -335,7 +330,7 @@ def claim_many(_receivers: address[20]) -> bool:
     @notice Make multiple fee claims in a single call
     @dev Used to claim for many accounts at once, or to make
          multiple claims for the same address when that address
-         has significant veCRV history
+         has significant veCC history
     @param _receivers List of addresses to claim for. Claiming
                       terminates at the first `ZERO_ADDRESS`.
     @return bool success
@@ -353,7 +348,7 @@ def claim_many(_receivers: address[20]) -> bool:
 
     last_token_time = last_token_time / WEEK * WEEK
     voting_escrow: address = self.voting_escrow
-    token: address = self.token
+    # token: address = self.token
     total: uint256 = 0
 
     for addr in _receivers:
@@ -362,7 +357,7 @@ def claim_many(_receivers: address[20]) -> bool:
 
         amount: uint256 = self._claim(addr, voting_escrow, last_token_time)
         if amount != 0:
-            assert ERC20(token).transfer(addr, amount)
+            send(addr, amount)
             total += amount
 
     if total != 0:
@@ -372,18 +367,16 @@ def claim_many(_receivers: address[20]) -> bool:
 
 
 @external
-def burn(_coin: address) -> bool:
+@payable
+def burn() -> bool:
     """
     @notice Receive 3CRV into the contract and trigger a token checkpoint
-    @param _coin Address of the coin being received (must be 3CRV)
     @return bool success
     """
-    assert _coin == self.token
     assert not self.is_killed
 
-    amount: uint256 = ERC20(_coin).balanceOf(msg.sender)
+    amount: uint256 = msg.value
     if amount != 0:
-        ERC20(_coin).transferFrom(msg.sender, self, amount)
         if self.can_checkpoint_token and (block.timestamp > self.last_token_time + TOKEN_CHECKPOINT_DEADLINE):
             self._checkpoint_token()
 
@@ -435,8 +428,7 @@ def kill_me():
 
     self.is_killed = True
 
-    token: address = self.token
-    assert ERC20(token).transfer(self.emergency_return, ERC20(token).balanceOf(self))
+    send(self.emergency_return, self.balance)
 
 
 @external
@@ -448,7 +440,6 @@ def recover_balance(_coin: address) -> bool:
     @return bool success
     """
     assert msg.sender == self.admin
-    assert _coin != self.token
 
     amount: uint256 = ERC20(_coin).balanceOf(self)
     response: Bytes[32] = raw_call(

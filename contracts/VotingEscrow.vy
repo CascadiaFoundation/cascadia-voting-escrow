@@ -1,7 +1,7 @@
-# @version 0.2.4
+# @version 0.2.7
 """
 @title Voting Escrow
-@author Curve Finance
+@author Cascadia & Curve Finance
 @license MIT
 @notice Votes have a weight depending on time, so that users are
         committed to the future of (whatever they are voting for)
@@ -33,16 +33,8 @@ struct Point:
 
 struct LockedBalance:
     amount: int128
+    cooldown: uint256
     end: uint256
-
-
-interface ERC20:
-    def decimals() -> uint256: view
-    def name() -> String[64]: view
-    def symbol() -> String[32]: view
-    def transfer(to: address, amount: uint256) -> bool: nonpayable
-    def transferFrom(spender: address, to: address, amount: uint256) -> bool: nonpayable
-
 
 # Interface for checking whether address belongs to a whitelisted
 # type of a smart wallet.
@@ -56,6 +48,9 @@ DEPOSIT_FOR_TYPE: constant(int128) = 0
 CREATE_LOCK_TYPE: constant(int128) = 1
 INCREASE_LOCK_AMOUNT: constant(int128) = 2
 INCREASE_UNLOCK_TIME: constant(int128) = 3
+
+CREATE_COOLDOWN_LOCK: constant(int128) = 4
+START_COOLDOWN: constant(int128) = 5
 
 
 event CommitOwnership:
@@ -80,12 +75,23 @@ event Supply:
     prevSupply: uint256
     supply: uint256
 
+event LockBot:
+    lockbot: address
+
+event MinTime:
+    mintime: uint256
+    
+event MaxTimeDiv:
+    maxtimediv: uint256
 
 WEEK: constant(uint256) = 7 * 86400  # all future times are rounded by week
 MAXTIME: constant(uint256) = 4 * 365 * 86400  # 4 years
 MULTIPLIER: constant(uint256) = 10 ** 18
 
-token: public(address)
+min_time: public(uint256)
+max_time_div: public(uint256)
+allow_time_change: public(bool)
+
 supply: public(uint256)
 
 locked: public(HashMap[address, LockedBalance])
@@ -113,30 +119,77 @@ smart_wallet_checker: public(address)
 admin: public(address)  # Can and will be a smart contract
 future_admin: public(address)
 
+lock_bot: public(address)
+
 
 @external
-def __init__(token_addr: address, _name: String[64], _symbol: String[32], _version: String[32]):
+def __init__(_name: String[64], _symbol: String[32], _version: String[32]):
     """
     @notice Contract constructor
-    @param token_addr `ERC20CRV` token address
     @param _name Token name
     @param _symbol Token symbol
     @param _version Contract version - required for Aragon compatibility
     """
     self.admin = msg.sender
-    self.token = token_addr
+
     self.point_history[0].blk = block.number
     self.point_history[0].ts = block.timestamp
     self.controller = msg.sender
     self.transfersEnabled = True
 
-    _decimals: uint256 = ERC20(token_addr).decimals()
-    assert _decimals <= 255
-    self.decimals = _decimals
+    self.decimals = 18
 
     self.name = _name
     self.symbol = _symbol
     self.version = _version
+    
+    self.min_time = 16 * 7 * 86400 # 16 weeks
+    self.max_time_div = 1
+    self.allow_time_change = True
+
+
+@external
+def set_lock_bot(addr: address):
+    """
+    @notice set lock bot that can create locks for others to `addr`
+    @param addr Address to be set as lock bot
+    """
+    assert msg.sender == self.admin
+    self.lock_bot = addr
+    log LockBot(addr)
+
+
+@external
+def change_min_time(new_min_time: uint256):
+    """
+    @notice Change minimum required lock time
+    @param new_min_time New minimum required lock time
+    """
+    assert msg.sender == self.admin
+    assert self.allow_time_change == True
+    self.min_time = new_min_time
+    log MinTime(new_min_time)
+
+
+@external
+def change_max_time_div(new_max_time_div: uint256):
+    """
+    @notice Change allowed MAXTIME divisor
+    @param new_max_time_div New MAXTIME divisor
+    """
+    assert msg.sender == self.admin
+    assert self.allow_time_change == True
+    self.max_time_div = new_max_time_div
+    log MaxTimeDiv(new_max_time_div)
+
+
+@external
+def disallow_time_change():
+    """
+    @notice Permanently disallow changes to min_time and max_time_div
+    """
+    assert msg.sender == self.admin
+    self.allow_time_change = False
 
 
 @external
@@ -247,10 +300,18 @@ def _checkpoint(addr: address, old_locked: LockedBalance, new_locked: LockedBala
     if addr != ZERO_ADDRESS:
         # Calculate slopes and biases
         # Kept at zero when they have to
-        if old_locked.end > block.timestamp and old_locked.amount > 0:
+        # Cooldown for old lock
+        if old_locked.cooldown > 0 and old_locked.amount > 0:
+            u_old.slope = 0
+            u_old.bias = (old_locked.amount / MAXTIME) * convert(((block.timestamp + old_locked.cooldown) / WEEK)*WEEK - block.timestamp, int128)
+        elif old_locked.end > block.timestamp and old_locked.amount > 0:
             u_old.slope = old_locked.amount / MAXTIME
             u_old.bias = u_old.slope * convert(old_locked.end - block.timestamp, int128)
-        if new_locked.end > block.timestamp and new_locked.amount > 0:
+        # Cooldown for new lock
+        if new_locked.cooldown > 0 and new_locked.amount > 0:
+            u_new.slope = 0
+            u_new.bias = (new_locked.amount / MAXTIME) * convert(((block.timestamp + new_locked.cooldown) / WEEK)*WEEK - block.timestamp, int128)
+        elif new_locked.end > block.timestamp and new_locked.amount > 0:
             u_new.slope = new_locked.amount / MAXTIME
             u_new.bias = u_new.slope * convert(new_locked.end - block.timestamp, int128)
 
@@ -363,18 +424,24 @@ def _deposit_for(_addr: address, _value: uint256, unlock_time: uint256, locked_b
     old_locked: LockedBalance = _locked
     # Adding to existing lock, or if a lock is expired - creating a new one
     _locked.amount += convert(_value, int128)
-    if unlock_time != 0:
+    # Cooldown implementation
+    if type == CREATE_COOLDOWN_LOCK:
+        _locked.end = MAX_UINT256
+        _locked.cooldown = unlock_time
+    elif type == START_COOLDOWN:
+        _locked.end = unlock_time
+        _locked.cooldown = 0
+    
+    elif unlock_time != 0:
         _locked.end = unlock_time
     self.locked[_addr] = _locked
 
+    
     # Possibilities:
     # Both old_locked.end could be current or expired (>/< block.timestamp)
     # value == 0 (extend lock) or value > 0 (add to lock or extend lock)
     # _locked.end > block.timestamp (always)
     self._checkpoint(_addr, old_locked, _locked)
-
-    if _value != 0:
-        assert ERC20(self.token).transferFrom(_addr, self, _value)
 
     log Deposit(_addr, _value, _locked.end, type, block.timestamp)
     log Supply(supply_before, supply_before + _value)
@@ -389,60 +456,139 @@ def checkpoint():
 
 
 @external
+@payable
 @nonreentrant('lock')
-def deposit_for(_addr: address, _value: uint256):
+def deposit_for(_addr: address):
     """
-    @notice Deposit `_value` tokens for `_addr` and add to the lock
+    @notice Deposit `msg.value` tokens for `_addr` and add to the lock
     @dev Anyone (even a smart contract) can deposit for someone else, but
          cannot extend their locktime and deposit for a brand new user
     @param _addr User's wallet address
-    @param _value Amount to add to user's lock
     """
     _locked: LockedBalance = self.locked[_addr]
 
-    assert _value > 0  # dev: need non-zero value
+    assert msg.value > 0  # dev: need non-zero value
     assert _locked.amount > 0, "No existing lock found"
     assert _locked.end > block.timestamp, "Cannot add to expired lock. Withdraw"
 
-    self._deposit_for(_addr, _value, 0, self.locked[_addr], DEPOSIT_FOR_TYPE)
+    self._deposit_for(_addr, msg.value, 0, self.locked[_addr], DEPOSIT_FOR_TYPE)
 
 
 @external
+@payable
 @nonreentrant('lock')
-def create_lock(_value: uint256, _unlock_time: uint256):
+def create_lock(_unlock_time: uint256):
     """
-    @notice Deposit `_value` tokens for `msg.sender` and lock until `_unlock_time`
-    @param _value Amount to deposit
+    @notice Deposit `msg.value` native tokens for `msg.sender` and lock until `_unlock_time`
     @param _unlock_time Epoch time when tokens unlock, rounded down to whole weeks
     """
     self.assert_not_contract(msg.sender)
     unlock_time: uint256 = (_unlock_time / WEEK) * WEEK  # Locktime is rounded down to weeks
     _locked: LockedBalance = self.locked[msg.sender]
 
-    assert _value > 0  # dev: need non-zero value
+    assert msg.value > 0  # dev: need non-zero value
     assert _locked.amount == 0, "Withdraw old tokens first"
     assert unlock_time > block.timestamp, "Can only lock until time in the future"
-    assert unlock_time <= block.timestamp + MAXTIME, "Voting lock can be 4 years max"
+    assert unlock_time <= block.timestamp + MAXTIME / self.max_time_div, "Exceeds allowed MAXTIME"
+    assert unlock_time >= block.timestamp + self.min_time, "Lock below min_time"
 
-    self._deposit_for(msg.sender, _value, unlock_time, _locked, CREATE_LOCK_TYPE)
+    self._deposit_for(msg.sender, msg.value, unlock_time, _locked, CREATE_LOCK_TYPE)
+
+
+@external
+@payable
+@nonreentrant('lock')
+def create_cooldown_lock(_cooldown: uint256):
+    """
+    @notice Deposit `msg.value` tokens for `msg.sender` lock with `_cooldown` period
+    @param _cooldown Cooldown period for unlock
+    """
+    self.assert_not_contract(msg.sender)
+    #unlock_time: uint256 = (_unlock_time / WEEK) * WEEK  # Locktime is rounded down to weeks
+    _locked: LockedBalance = self.locked[msg.sender]
+
+    assert msg.value > 0  # dev: need non-zero value
+    assert _locked.amount == 0, "Withdraw old tokens first"
+    #assert unlock_time > block.timestamp, "Can only lock until time in the future"
+    assert _cooldown <= MAXTIME / self.max_time_div, "Cooldown exceeds MAXTIME"
+    assert _cooldown >= self.min_time, "Cooldown below min_time"
+
+    self._deposit_for(msg.sender, msg.value, _cooldown, _locked, CREATE_COOLDOWN_LOCK)
+
+
+@external
+@payable
+@nonreentrant('lock')
+def create_cooldown_lock_for(_cooldown: uint256, _addr: address):
+    """
+    @notice Deposit `msg.value` tokens for _addr and lock with `_cooldown` period
+    @param _cooldown Cooldown period for unlock
+    @param _addr address to create the lock for
+    """
+    assert msg.sender == self.lock_bot, "Not whitelisted"
+    
+    _locked: LockedBalance = self.locked[_addr]
+
+    assert msg.value > 0  # dev: need non-zero value
+    assert _locked.amount == 0, "Withdraw old tokens first"
+    #assert unlock_time > block.timestamp, "Can only lock until time in the future"
+    assert _cooldown <= MAXTIME / self.max_time_div, "Cooldown exceeds MAXTIME"
+    assert _cooldown >= self.min_time, "Cooldown below min_time"
+
+    self._deposit_for(_addr, msg.value, _cooldown, _locked, CREATE_COOLDOWN_LOCK)
 
 
 @external
 @nonreentrant('lock')
-def increase_amount(_value: uint256):
+def start_cooldown():
     """
-    @notice Deposit `_value` additional tokens for `msg.sender`
-            without modifying the unlock time
-    @param _value Amount of tokens to deposit and add to the lock
+    @notice Start the cooldown unlock mechanism for `msg.sender` 
+    """
+    self.assert_not_contract(msg.sender)
+    _locked: LockedBalance = self.locked[msg.sender]
+    unlock_time: uint256 = ((_locked.cooldown + block.timestamp) / WEEK) * WEEK  # Locktime is rounded down to weeks
+
+    assert _locked.cooldown > 0, "Lock has no cooldown"
+    assert _locked.amount > 0, "Nothing is locked"
+
+    self._deposit_for(msg.sender, 0, unlock_time, _locked, START_COOLDOWN)
+
+
+@external
+@nonreentrant('lock')
+def renew_cooldown(_cooldown: uint256):
+    """
+    @notice Extend the unlock time for `msg.sender` to `_unlock_time`
+    @param _cooldown unlock time of new cooldown
     """
     self.assert_not_contract(msg.sender)
     _locked: LockedBalance = self.locked[msg.sender]
 
-    assert _value > 0  # dev: need non-zero value
+    assert _cooldown + block.timestamp > _locked.end, "Cooldown needs to be longer than existing lock"
+    assert _locked.end > block.timestamp, "Lock expired"
+    assert _locked.amount > 0, "Nothing is locked"
+    assert _cooldown <= MAXTIME / self.max_time_div, "Cooldown exceeds MAXTIME"
+    assert _cooldown >= self.min_time, "Cooldown below min_time"
+
+    self._deposit_for(msg.sender, 0, _cooldown, _locked, CREATE_COOLDOWN_LOCK)
+
+
+@external
+@payable
+@nonreentrant('lock')
+def increase_amount():
+    """
+    @notice Deposit `msg.value` additional tokens for `msg.sender`
+            without modifying the unlock time
+    """
+    self.assert_not_contract(msg.sender)
+    _locked: LockedBalance = self.locked[msg.sender]
+
+    assert msg.value > 0  # dev: need non-zero value
     assert _locked.amount > 0, "No existing lock found"
     assert _locked.end > block.timestamp, "Cannot add to expired lock. Withdraw"
 
-    self._deposit_for(msg.sender, _value, 0, _locked, INCREASE_LOCK_AMOUNT)
+    self._deposit_for(msg.sender, msg.value, 0, _locked, INCREASE_LOCK_AMOUNT)
 
 
 @external
@@ -459,7 +605,8 @@ def increase_unlock_time(_unlock_time: uint256):
     assert _locked.end > block.timestamp, "Lock expired"
     assert _locked.amount > 0, "Nothing is locked"
     assert unlock_time > _locked.end, "Can only increase lock duration"
-    assert unlock_time <= block.timestamp + MAXTIME, "Voting lock can be 4 years max"
+    assert unlock_time <= block.timestamp + MAXTIME / self.max_time_div, "Exceeds allowed MAXTIME"
+    assert unlock_time >= block.timestamp + self.min_time, "Lock below min_time"
 
     self._deposit_for(msg.sender, 0, unlock_time, _locked, INCREASE_UNLOCK_TIME)
 
@@ -474,6 +621,7 @@ def withdraw():
     _locked: LockedBalance = self.locked[msg.sender]
     assert block.timestamp >= _locked.end, "The lock didn't expire"
     value: uint256 = convert(_locked.amount, uint256)
+    assert value > 0
 
     old_locked: LockedBalance = _locked
     _locked.end = 0
@@ -487,7 +635,7 @@ def withdraw():
     # Both can have >= 0 amount
     self._checkpoint(msg.sender, old_locked, _locked)
 
-    assert ERC20(self.token).transfer(msg.sender, value)
+    send(msg.sender, value)
 
     log Withdraw(msg.sender, value, block.timestamp)
     log Supply(supply_before, supply_before - value)
